@@ -212,9 +212,14 @@ lp_to_resistance <- function(lp, min_resistance = 1, max_resistance = 100, shape
   # As h approaches 0 (lower selection), resistance rises toward max_resistance
   # shape_parameter controls curvature (larger = resistance drops off faster as habitat improves)
   # the (1 - exp(-c*h)) / (1 - exp(-c)) term is already scaled to 0-1, so resistance hits exactly min/max without a separate rescaling step.
-  resistance <- max_resistance -
-    (max_resistance - min_resistance) *
-    ((1 - exp(-shape_parameter * h)) / (1 - exp(-shape_parameter)))
+  # resistance <- max_resistance -
+   # (max_resistance - min_resistance) *
+   # ((1 - exp(-shape_parameter * h)) / (1 - exp(-shape_parameter)))
+  
+  # Linear transformation:
+  # h = 1 (high selection) -> min_resistance
+  # h = 0 (low selection)  -> max_resistance
+  resistance <- max_resistance - (max_resistance - min_resistance) * h
   
   names(resistance) <- "resistance"
   
@@ -642,7 +647,5 @@ plot(res_wet_linear, main = "KAZA Wet Season: Linear-Features Resistance")
 plot(res_dry_linear, main = "KAZA Dry Season: Linear-Features Resistance")
 
 ```
-```{r}
-list.files(here("outputs"), pattern = "ele_trk", recursive = TRUE, full.names = TRUE)
-```
+`
 
