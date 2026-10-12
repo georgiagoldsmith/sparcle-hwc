@@ -1,0 +1,371 @@
+---
+title: "kaza_resistance_yearly"
+author: ""
+date: "2026-10-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# =====================================================================
+# KAZA yearly resistance surfaces from the hydrological-year base SSF
+# Inputs come from kaza_ssf_yearly.Rmd:
+#   outputs/kaza_ssf_base_by_hydroyear.rds  (per-year fits + sample table)
+#   outputs/kaza_ssf_base_scaling.rds       (pooled means/SDs per season)
+# =====================================================================
+
+library(tidyverse)
+library(terra)
+library(here)
+select <- dplyr::select
+```
+
+```{r config}
+# ---------------------------------------------------------------------
+# 0. Config
+# ---------------------------------------------------------------------
+pop_label <- "kaza"
+
+gee_folder     <- here("data", "500m_data")
+lc_dist_folder <- here("data", "ESACCI_LCCS", "lc_dist_2")
+evi_folder     <- here("data", "500m_data", "EVI data")
+out_folder     <- here("outputs", "resistance_surfaces", "yearly")   # >>> NEW: own folder
+dir.create(out_folder, showWarnings = FALSE, recursive = TRUE)
+
+lc_types <- c("cropland", "grassland", "shrubland", "tree_cover", "urban", "water_rivers")
+
+crop_extent <- ext(12.5, 25.5, -21.5, -16.5)
+target_res  <- 0.0045  # ~500 m in degrees
+template    <- rast(crop_extent, resolution = target_res, crs = "EPSG:4326")
+
+# >>> NEW: both transforms the team asked for; negexp written once per c value
+transforms <- c("linear", "negexp")
+negexp_c   <- c(2, 8)
+```
+
+```{r load-ssf}
+# ---------------------------------------------------------------------
+# 1. Load SSF outputs (replaces m0_*_coefonly.rds)
+# ---------------------------------------------------------------------
+yr <- readRDS(here("outputs", "kaza_ssf_base_by_hydroyear.rds"))
+sc <- readRDS(here("outputs", "kaza_ssf_base_scaling.rds"))
+base_vars <- sc$vars
+
+# Which hydro years passed the sample-size gate (only these have fits)
+print(yr$dry$samples, n = Inf)
+print(yr$wet$samples, n = Inf)
+
+fit_years <- list(dry = names(yr$dry$fits), wet = names(yr$wet$fits))
+
+# Area where the SSF is valid (mask before transforming)
+valid_area_kaza <- vect(here("outputs", "kaza_valid_area.gpkg"))
+```
+
+```{r static-layers}
+# ---------------------------------------------------------------------
+# 2. Static layers: built ONCE, reused for every year
+# ---------------------------------------------------------------------
+build_static_stack <- function() {
+  static_files <- c(
+    # CHECK: must be the same core_dist file used in the SSF extraction
+    core_dist  = file.path(gee_folder, "core_dist_rast_500m.tif"),
+    fence_dist = file.path(gee_folder, "fences_dist_rast_500m.tif"),
+    road_dist  = file.path(gee_folder, "roads_distance_rast_500m.tif")
+  )
+  r_stack <- rast(map(static_files, ~ project(rast(.x), template, method = "bilinear")))
+  names(r_stack) <- names(static_files)
+
+  terrain_native <- rast(file.path(gee_folder, "terrain_rast_500m.tif"))
+  if (!all(c("slope", "aspect") %in% names(terrain_native))) {
+    stop("Terrain layers are named: ", paste(names(terrain_native), collapse = ", "),
+         " -- need 'slope' and 'aspect'")
+  }
+  slope <- project(terrain_native[["slope"]], template, method = "bilinear")
+
+  # >>> CHANGED: northness/eastness computed from NATIVE aspect, then projected.
+  # Projecting aspect itself with bilinear averages across 0/360 (359 & 1 -> 180).
+  # Negative aspect = flat-cell sentinel -> NA.
+  # CHECK: should match how aspect was handled in the SSF extraction.
+  asp <- ifel(terrain_native[["aspect"]] < 0, NA, terrain_native[["aspect"]])
+  northness <- project(cos(asp * pi / 180), template, method = "bilinear")
+  eastness  <- project(sin(asp * pi / 180), template, method = "bilinear")
+  names(northness) <- "northness"
+  names(eastness)  <- "eastness"
+
+  c(r_stack, slope, northness, eastness)
+}
+
+static_stack <- build_static_stack()
+
+# world_pop: project all layers once, index by year later
+world_pop_all <- project(rast(file.path(gee_folder, "worldPop_comb_img_500m.tif")),
+                         template, method = "bilinear")
+```
+
+```{r year-layers}
+# ---------------------------------------------------------------------
+# 3. Year-specific layers
+# ---------------------------------------------------------------------
+# Hydro year Y = Nov (Y-1) – Oct Y.
+#   dry HY Y -> evi_dry_Y
+#   wet HY Y -> evi_wet_(Y-1)_Y
+# Land cover and world_pop use calendar year Y.
+# CHECK: confirm this matches the year matching in the SSF extraction.
+
+lc_paths <- function(year) {
+  setNames(file.path(lc_dist_folder, paste0("dist_", lc_types, "_", year, ".tif")), lc_types)
+}
+
+evi_path <- function(season, year) {
+  if (season == "dry") {
+    file.path(evi_folder, paste0("evi_dry_", year, ".tif"))
+  } else {
+    file.path(evi_folder, paste0("evi_wet_", year - 1, "_", year, ".tif"))
+  }
+}
+
+build_lc_dist_year <- function(year) {
+  paths <- lc_paths(year)
+  missing_lc <- names(paths)[!file.exists(paths)]
+  if (length(missing_lc) > 0) {
+    stop("Land-cover distance rasters missing for ", year, ": ", paste(missing_lc, collapse = ", "))
+  }
+  r_stack <- rast(map(paths, ~ project(rast(.x), template, method = "bilinear")))
+  names(r_stack) <- paste0(names(paths), "_dist")
+  r_stack
+}
+
+build_evi_year <- function(season, year) {
+  fp <- evi_path(season, year)
+  if (!file.exists(fp)) stop("EVI raster not found: ", fp)
+  r <- project(rast(fp), template, method = "bilinear")
+  names(r) <- "evi"
+  r
+}
+
+get_world_pop <- function(year) {
+  layer_idx <- year - 1999  # matches indexing used in the SSF extraction
+  if (layer_idx < 1 || layer_idx > nlyr(world_pop_all)) {
+    stop("No world_pop layer for year ", year)
+  }
+  pop <- world_pop_all[[layer_idx]]
+  names(pop) <- "world_pop"
+  pop
+}
+
+build_year_stack <- function(season, hydro_year) {
+  c(static_stack,
+    build_lc_dist_year(hydro_year),
+    build_evi_year(season, hydro_year),
+    get_world_pop(hydro_year))
+}
+```
+
+```{r preflight}
+# ---------------------------------------------------------------------
+# 4. Preflight: which fitted years have all their rasters?
+# ---------------------------------------------------------------------
+preflight <- map_dfr(names(fit_years), \(s) tibble(season = s, hydro_year = as.integer(fit_years[[s]]))) |>
+  mutate(
+    evi_ok = map2_lgl(season, hydro_year, ~ file.exists(evi_path(.x, .y))),
+    lc_ok  = map_lgl(hydro_year, ~ all(file.exists(lc_paths(.x)))),
+    pop_ok = between(hydro_year - 1999, 1, nlyr(world_pop_all)),
+    ready  = evi_ok & lc_ok & pop_ok
+  )
+
+print(preflight, n = Inf)
+```
+
+```{r functions}
+# ---------------------------------------------------------------------
+# 5. Scale, predict, transform
+# ---------------------------------------------------------------------
+
+# >>> NEW: rasters MUST be scaled with the same constants used to fit the SSF.
+# If min/max columns exist in the scaling file, layers are first clamped to
+# the sampled range (limits extrapolation).
+scale_stack <- function(cov_stack, sc_season) {
+  missing_vars <- setdiff(sc_season$var, names(cov_stack))
+  if (length(missing_vars) > 0) {
+    stop("Scaled covariates missing from raster stack: ", paste(missing_vars, collapse = ", "))
+  }
+  has_range <- all(c("min", "max") %in% names(sc_season))
+  for (i in seq_len(nrow(sc_season))) {
+    v <- sc_season$var[i]
+    r <- cov_stack[[v]]
+    if (has_range) r <- clamp(r, sc_season$min[i], sc_season$max[i], values = TRUE)
+    cov_stack[[v]] <- (r - sc_season$mean[i]) / sc_season$sd[i]
+  }
+  cov_stack
+}
+
+predict_ssf_surface <- function(model, cov_stack, sc_season) {
+  betas <- if (!is.null(model$model)) coef(model$model) else if (!is.null(model$coef)) model$coef else coef(model)
+  betas <- betas[!is.na(betas)]
+
+  # every coefficient must correspond to a scaled layer
+  unscaled <- setdiff(names(betas), sc_season$var)
+  if (length(unscaled) > 0) stop("Coefficients without scaling constants: ", paste(unscaled, collapse = ", "))
+
+  weighted <- lapply(names(betas), \(nm) cov_stack[[nm]] * betas[[nm]])
+  lp <- sum(rast(weighted))
+  names(lp) <- "linear_predictor"
+  lp
+}
+
+# >>> CHANGED: linear and negative-exponential (Keeley et al. 2016) in one function
+lp_to_resistance <- function(lp, transform = c("linear", "negexp"), c = 8,
+                             min_resistance = 1, max_resistance = 100,
+                             clip = c(0.01, 0.99)) {
+  transform <- match.arg(transform)
+  q <- as.numeric(quantile(values(lp, na.rm = TRUE), probs = clip))
+  h <- (clamp(lp, lower = q[1], upper = q[2]) - q[1]) / (q[2] - q[1])  # 0 = least, 1 = most selected
+
+  frac <- if (transform == "linear") h else (1 - exp(-c * h)) / (1 - exp(-c))
+  resistance <- max_resistance - (max_resistance - min_resistance) * frac
+  names(resistance) <- "resistance"
+  resistance
+}
+```
+
+```{r run-one}
+# ---------------------------------------------------------------------
+# 6. One season x hydro year
+# ---------------------------------------------------------------------
+run_one_year <- function(season, hydro_year) {
+  message("== ", pop_label, " ", season, " HY", hydro_year)
+  model <- yr[[season]]$fits[[as.character(hydro_year)]]
+
+  cov_stack <- build_year_stack(season, hydro_year) |> scale_stack(sc[[season]])
+  lp <- predict_ssf_surface(model, cov_stack, sc[[season]]) |> mask(valid_area_kaza)
+
+  stem <- paste0(pop_label, "_", season, "_hy", hydro_year)
+
+  # save the linear predictor so transforms can be redone without rebuilding stacks
+  writeRaster(lp, file.path(out_folder, paste0("lp_", stem, ".tif")), overwrite = TRUE)
+
+  specs <- bind_rows(
+    if ("linear" %in% transforms) tibble(transform = "linear", c = NA_real_),
+    if ("negexp" %in% transforms) tibble(transform = "negexp", c = negexp_c)
+  )
+  files <- pmap_chr(specs, \(transform, c) {
+    r  <- lp_to_resistance(lp, transform = transform, c = ifelse(is.na(c), 8, c))
+    fn <- paste0("resistance_", stem, "_", transform, if (!is.na(c)) paste0("_c", c) else "", ".tif")
+    writeRaster(r, file.path(out_folder, fn), overwrite = TRUE)
+    fn
+  })
+
+  st <- global(lp, c("min", "max", "mean", "sd"), na.rm = TRUE)
+  tibble(season = season, hydro_year = hydro_year, status = "ok",
+         lp_min = st$min, lp_max = st$max, lp_mean = st$mean, lp_sd = st$sd,
+         files = paste(files, collapse = "; "))
+}
+```
+
+```{r test-one}
+# ---------------------------------------------------------------------
+# 7. Test on ONE year before the full loop
+# ---------------------------------------------------------------------
+# lp should span a modest range (a few units). Tens/hundreds = scaling problem.
+test_year <- preflight |> filter(ready, season == "dry") |> slice(1) |> pull(hydro_year)
+test <- run_one_year("dry", test_year)
+test
+plot(rast(file.path(out_folder, paste0("lp_kaza_dry_hy", test_year, ".tif"))),
+     main = paste("Linear predictor, dry HY", test_year))
+```
+
+```{r}
+fig_folder <- here("figures")
+
+season_label <- function(season, hy) {
+  if (season == "dry") paste0("Dry season (May–Oct ", hy, ")")
+  else                 paste0("Wet season (Nov ", hy - 1, " – Apr ", hy, ")")
+}
+
+transform_titles <- c(
+  linear    = "Linear transform",
+  negexp_c2 = "Neg. exponential (c = 2)",
+  negexp_c8 = "Neg. exponential (c = 8)"
+)
+
+plot_resistance_year <- function(pop_label, season, hydro_year,
+                                 transforms = c("linear", "negexp_c8"),
+                                 version = NULL, save = TRUE) {
+  stem  <- paste0("resistance_", pop_label, "_", season, "_hy", hydro_year,
+                  if (!is.null(version)) paste0("_", version) else "")
+  files <- file.path(out_folder, paste0(stem, "_", transforms, ".tif"))
+  missing <- files[!file.exists(files)]
+  if (length(missing) > 0) stop("Missing: ", paste(basename(missing), collapse = ", "))
+
+  r   <- rast(files) |> crop(valid_area_kaza)
+  pal <- colorRampPalette(c("#1a9850", "#a6d96a", "#fee08b", "#e08b3a", "#8c2d04"))(100)
+  main_title <- paste0(toupper(pop_label), "  |  ", season_label(season, hydro_year),
+                       "  |  Hydrological year ", hydro_year,
+                       if (!is.null(version)) paste0("  |  ", version) else "")
+  n <- length(files)                                          # >>> RESTORED
+
+  draw <- function() {
+    op <- par(mfrow = c(1, n), oma = c(0, 0, 2.5, 0))
+    on.exit(par(op))
+    for (i in seq_len(n)) {
+      last <- i == n
+      terra::plot(r[[i]], col = pal, range = c(1, 100),
+                  main = transform_titles[[transforms[i]]], cex.main = 1,
+                  axes = TRUE, box = FALSE,
+                  mar = c(2.5, 3, 2, if (last) 6 else 1),
+                  legend = last,
+                  plg = list(title = "Resistance", title.cex = 0.8, cex = 0.8),
+                  pax = list(cex.axis = 0.8))
+      lines(valid_area_kaza, col = "grey30", lwd = 0.8)
+    }
+    mtext(main_title, outer = TRUE, line = 0.8, font = 2, cex = 1.05)
+  }
+
+  draw()
+  if (save) {
+    out_png <- file.path(fig_folder, paste0("fig_", stem, ".png"))
+    png(out_png, width = 5 * n + 1, height = 3.6, units = "in", res = 200)
+    draw()
+    dev.off()
+    message("saved: ", out_png)
+  }
+}
+
+# >>> NEW: call it, otherwise nothing is drawn or saved
+plot_resistance_year("kaza", "dry", 2010)
+```
+
+
+```{r run-all}
+# ---------------------------------------------------------------------
+# 8. All ready years; failures are logged, not fatal
+# ---------------------------------------------------------------------
+results <- preflight |>
+  filter(ready) |>
+  select(season, hydro_year) |>
+  pmap_dfr(\(season, hydro_year) {
+    tryCatch(
+      run_one_year(season, hydro_year),
+      error = \(e) {
+        message("Skipped ", season, " HY", hydro_year, ": ", conditionMessage(e))
+        tibble(season = season, hydro_year = hydro_year, status = conditionMessage(e))
+      }
+    )
+  })
+
+print(results, n = Inf)
+write_csv(results, file.path(out_folder, "kaza_resistance_yearly_log.csv"))
+```
+
+```{r visualize}
+# ---------------------------------------------------------------------
+# 9. Quick look: linear resistance by year, per season
+# ---------------------------------------------------------------------
+for (s in c("dry", "wet")) {
+  fs <- list.files(out_folder, pattern = paste0("^resistance_kaza_", s, "_hy\\d{4}_linear\\.tif$"),
+                   full.names = TRUE)
+  if (length(fs) == 0) next
+  r <- rast(fs)
+  names(r) <- str_extract(basename(fs), "hy\\d{4}")
+  plot(r, main = paste0(s, " ", names(r)), col = rev(terrain.colors(100)))
+}
+```
