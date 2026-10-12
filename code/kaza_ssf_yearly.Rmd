@@ -187,15 +187,6 @@ ggplot(coef_by_year, aes(x = hydro_year, y = estimate)) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1),
         strip.text.y = element_text(angle = 0))
 
-# ---------------------------------------------------------------------
-# Step 6g: Save
-# ---------------------------------------------------------------------
-saveRDS(list(dry = m_base_dry, wet = m_base_wet),
-        here("outputs", "kaza_ssf_base_pooled.rds"))
-saveRDS(list(dry = yr_dry, wet = yr_wet),
-        here("outputs", "kaza_ssf_base_by_hydroyear.rds"))
-saveRDS(list(dry = sc_dry, wet = sc_wet, vars = base_vars),
-        here("outputs", "kaza_ssf_base_scaling.rds"))
 ```
 
 ```{r}
@@ -209,21 +200,13 @@ saveRDS(list(dry = yr_dry, wet = yr_wet),
 saveRDS(list(dry = sc_dry, wet = sc_wet, vars = base_vars),
         here("outputs", "kaza_ssf_base_scaling.rds"))
 ```
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r}
+write_csv(coef_by_year, here("outputs", "kaza_ssf_coef_by_hydroyear.csv"))
+write_csv(bind_rows(yr_dry$samples |> mutate(season = "dry"),
+                    yr_wet$samples |> mutate(season = "wet")),
+          here("outputs", "kaza_ssf_hydroyear_samples.csv"))
+ggsave(here("outputs", "kaza_ssf_coef_by_hydroyear.png"),
+       width = 10, height = 18)  # 14 terms stacked; it needs height
 ```
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
 Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
