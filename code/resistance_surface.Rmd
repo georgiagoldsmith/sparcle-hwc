@@ -588,7 +588,7 @@ res_kaza_dry <- run_resistance_all_years(m0_dry_kaza, "dry", pop_label, valid_ar
 # 8. Visualize
 # ------------------------------------------------------------
 plot(res_kaza_wet$by_year[[c("2010", "2015", "2020")]])
-plot(res_kaza_wet$by_year[[c("2010", "2015", "2020")]])
+plot(res_kaza_dry$by_year[[c("2010", "2015", "2020")]])
 plot(res_kaza_wet$mean_lp, main = "KAZA Wet Resistance (mean LP)")
 plot(res_kaza_dry$mean_lp,main = "KAZA Dry Resistance (mean LP)")
 plet(res_kaza_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
