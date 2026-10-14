@@ -20,7 +20,6 @@ library(here)
 # 0. Configuring
 # ------------------------------------------------------------
 pop_label    <- "etosha"
-target_years <- 2008:2020
 
 gee_folder      <- here("data", "500m_data")
 lc_dist_folder  <- here("data", "ESACCI_LCCS", "lc_dist_2")
@@ -38,8 +37,11 @@ template    <- rast(crop_extent, resolution = target_res, crs = "EPSG:4326")
 
 # 1. Load fitted SSF models and define valid area
 # ------------------------------------------------------------
-m0_etosha_wet <- readRDS(here("outputs", "m0_etosha_wet.rds"))
-m0_etosha_dry <- readRDS(here("outputs", "m0_etosha_dry.rds"))
+hydroyears_data <- readRDS(here("outputs", "etosha_ssf_base_by_hydroyear.rds"))
+scaling_data    <- readRDS(here("outputs", "etosha_ssf_base_scaling.rds"))
+
+fits_wet <- hydroyears_data$wet$fits   # names: "2010" "2011" "2012"
+fits_dry <- hydroyears_data$dry$fits   # names: "2009" "2010" "2011"
 
 # Area where the Etosha SSF is valid (used to mask out extrapolated pixels)
 ele_trk_extract_etosha <- readRDS(here("outputs", "ele_trk_extract_etosha.rds"))
@@ -58,7 +60,6 @@ valid_area_etosha <- buffer(convHull(etosha_vect), width = 50000)
 # 2. Build static covariate raster (seaonal)
 # ------------------------------------------------------------
 build_static_stack <- function() {
-  # CHECK: SSF extraction used "core_dist_rast_500m.tif" (no "_new")
   static_files <- c(
     core_dist  = file.path(gee_folder, "core_dist_rast_500m.tif"),
     fence_dist = file.path(gee_folder, "fences_dist_rast_500m.tif"),
@@ -68,7 +69,14 @@ build_static_stack <- function() {
   r_stack <- rast(r_list)
   names(r_stack) <- names(static_files)
 
-  terrain_r <- rast(file.path(gee_folder, "terrain_rast_500m.tif"))
+  terrain_raw <- rast(file.path(gee_folder, "terrain_rast_500m.tif"))
+
+  # Aspect (degrees) -> northness/eastness, computed before reprojecting
+  asp_rad    <- terrain_raw[["aspect"]] * pi / 180
+  northness  <- cos(asp_rad); names(northness) <- "northness"
+  eastness   <- sin(asp_rad); names(eastness)  <- "eastness"
+
+  terrain_r <- c(terrain_raw[[c("elevation", "slope")]], northness, eastness)
   terrain_r <- project(terrain_r, template, method = "bilinear")
 
   c(r_stack, terrain_r)
@@ -159,7 +167,19 @@ build_covariate_stack <- function(season, year) {
 
 # 7. Predict linear predictor / SSF from model coefficients (REVISED)
 # -----------------------------------------------------------
-predict_ssf_surface <- function(model, covariate_stack) {
+
+scale_stack <- function(covariate_stack, scaling_tbl) {
+  vars <- intersect(scaling_tbl$var, names(covariate_stack))
+  scaled <- lapply(vars, function(v) {
+    s <- scaling_tbl[scaling_tbl$var == v, ]
+    (covariate_stack[[v]] - s$mean) / s$sd
+  })
+  r <- rast(scaled)
+  names(r) <- vars
+  r
+}
+
+predict_ssf_surface <- function(model, covariate_stack, scaling_tbl) {
   # fit_clogit() wraps the model in '$model'; fall back to the object itself if not
   betas <- if (!is.null(model$model)) coef(model$model) else coef(model)
   betas <- betas[!is.na(betas)]
@@ -195,20 +215,22 @@ lp_to_resistance <- function(lp, min_resistance = 1, max_resistance = 100,
   resistance
 }
 
-#9. Run season across all years 
-# ------------------------------------------------------------
-run_resistance_all_years <- function(model, season, pop_label, valid_area,
-                                     years = target_years,
-                                     common_clip = TRUE) {
 
-#linear predictor for each year
+#9. Run one season using its year-specific fits
+# ------------------------------------------------------------
+run_resistance_all_years <- function(fits, season, pop_label, valid_area,
+                                     scaling_tbl, common_clip = TRUE) {
+
+  years   <- as.integer(names(fits))
   lp_list <- list()
+
   for (yr in years) {
     message("[", pop_label, "-", season, "] building LP for ", yr)
 
     lp <- tryCatch({
       cov_stack <- build_covariate_stack(season, yr)
-      mask(predict_ssf_surface(model, cov_stack), valid_area)
+      mask(predict_ssf_surface(fits[[as.character(yr)]], cov_stack, scaling_tbl),
+           valid_area)
     }, error = function(e) {
       warning("Skipping ", season, " ", yr, ": ", conditionMessage(e))
       NULL
@@ -223,7 +245,7 @@ run_resistance_all_years <- function(model, season, pop_label, valid_area,
   }
   if (length(lp_list) == 0) stop("No years completed for ", season)
 
-#clip bounds (pooled across years if common_clip = TRUE)
+  # clip bounds pooled across the season's years so years are comparable
   clip_values <- NULL
   if (common_clip) {
     pooled <- unlist(lapply(lp_list, function(r) values(r, na.rm = TRUE)))
@@ -231,10 +253,8 @@ run_resistance_all_years <- function(model, season, pop_label, valid_area,
     message("Common LP clip bounds: ", paste(round(clip_values, 3), collapse = " to "))
   }
 
-#resistance surface per year
   res_list <- list()
   for (yr in names(lp_list)) {
-    message("[", pop_label, "-", season, "] resistance for ", yr)
     res <- lp_to_resistance(lp_list[[yr]], clip_values = clip_values)
     writeRaster(res,
                 file.path(out_folder, paste0("resistance_", pop_label, "_", season, "_", yr, ".tif")),
@@ -242,7 +262,6 @@ run_resistance_all_years <- function(model, season, pop_label, valid_area,
     res_list[[yr]] <- res
   }
 
-  # Step D: resistance from the mean LP across years (same clip bounds)
   lp_mean  <- mean(rast(lp_list))
   res_mean <- lp_to_resistance(lp_mean, clip_values = clip_values)
   yrs      <- as.integer(names(lp_list))
@@ -252,24 +271,54 @@ run_resistance_all_years <- function(model, season, pop_label, valid_area,
               overwrite = TRUE)
 
   by_year <- rast(res_list)
-  names(by_year) <- names(res_list)   # layer names = years
-
+  names(by_year) <- names(res_list)
   list(by_year = by_year, mean_lp = res_mean)
 }
 
 #10. Run
 # ------------------------------------------------------------
-res_etosha_wet <- run_resistance_all_years(m0_etosha_wet, "wet", pop_label, valid_area_etosha, common_clip = TRUE)
-res_etosha_dry <- run_resistance_all_years(m0_etosha_dry, "dry", pop_label, valid_area_etosha, common_clip = TRUE)
+res_etosha_wet <- run_resistance_all_years(fits_wet, "wet", pop_label,
+                                           valid_area_etosha, scaling_data$wet)
+res_etosha_dry <- run_resistance_all_years(fits_dry, "dry", pop_label,
+                                           valid_area_etosha, scaling_data$dry)
 
 #11. Visualize
 # ------------------------------------------------------------
-plot(res_etosha_wet$by_year[[c("2010", "2015", "2020")]])
-plot(res_etosha_dry$by_year[[c("2010", "2015", "2020")]])
-plot(res_etosha_wet$mean_lp,           main = "Etosha Wet Resistance (mean LP)")
-plot(res_etosha_dry$mean_lp,           main = "Etosha Dry Resistance (mean LP)")
-plet(res_etosha_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
+plot(res_etosha_wet$by_year)   # 2010, 2011, 2012
+plot(res_etosha_dry$by_year)   # 2009, 2010, 2011
+plot(res_etosha_wet$mean_lp, main = "Etosha Wet Resistance (mean LP)")
+plot(res_etosha_dry$mean_lp, main = "Etosha Dry Resistance (mean LP)")
 ```
+
+```{r}
+# 1. Load the file and assign it to a variable name
+hydroyears_data <- readRDS("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/outputs/etosha_ssf_base_by_hydroyear.rds")
+
+# 2. View the full dataset in a spreadsheet-like tab (RStudio only)
+View(hydroyears_data)
+
+# 3. Inspect the structure and summary of the data
+str(hydroyears_data)       # Shows data types and structure
+summary(hydroyears_data)   # Provides statistical summaries
+head(hydroyears_data)      # Previews the first 6 rows
+
+```
+
+```{r}
+# 1. Load the file and assign it to a variable name
+scaling_data <- readRDS("~/Desktop/Arnhold/sparcle-hwc-old2/code/sparcle-hwc/outputs/etosha_ssf_base_scaling.rds")
+
+# 2. View the full dataset in a spreadsheet-like tab (RStudio only)
+View(scaling_data)
+
+# 3. Inspect the structure and summary of the data
+str(scaling_data)       # Shows data types and structure
+summary(scaling_data)   # Provides statistical summaries
+head(scaling_data)      # Previews the first 6 rows
+```
+
+
+
 
 ```{r}
 #Since the names of raster layers and coefficients must match for predict_ssf_surface()
