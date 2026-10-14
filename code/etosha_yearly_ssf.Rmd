@@ -1,0 +1,299 @@
+---
+title: "etosha yearly ssf"
+author: "Rachel Frost"
+date: "2026-10-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(amt)
+library(survival)
+library(terra)
+library(here)
+
+select <- dplyr::select   # prevent terra::select() masking
+filter <- dplyr::filter
+```
+
+## 1. Load the 1 h extraction
+
+```{r load}
+ele_trk_extract_etosha <- readRDS(here("outputs", "ele_trk_extract_etosha_1h.rds"))
+
+# Checks before fitting
+nrow(ele_trk_extract_etosha)                 # ~7,245,194
+n_distinct(ele_trk_extract_etosha$id)        # 39
+class(ele_trk_extract_etosha)                # should include "random_steps"
+
+# Confirm 1-hour steps (median ~60 min)
+ele_trk_extract_etosha |> as_tibble() |> filter(case_) |>
+  summarise(median_dt_min = median(as.numeric(dt_, units = "mins"), na.rm = TRUE))
+```
+
+## 2. Unique strata and dry/wet split
+
+```{r strata-seasons}
+# Strata must be unique per elephant
+cls <- class(ele_trk_extract_etosha)
+
+if (!"step_id" %in% names(ele_trk_extract_etosha)) {
+  ele_trk_extract_etosha <- ele_trk_extract_etosha |>
+    mutate(step_id = paste(id, step_id_, sep = "_"))
+}
+head(unique(ele_trk_extract_etosha$step_id))                                   # e.g. "AG006_12"
+mean(str_starts(ele_trk_extract_etosha$step_id, ele_trk_extract_etosha$id))   # should be 1
+
+# Seasons match KAZA (wet Nov–Apr, dry May–Oct), assigned on t1_
+ele_trk_extract_wet <- ele_trk_extract_etosha |> filter(month(t1_) %in% c(11, 12, 1:4))
+ele_trk_extract_dry <- ele_trk_extract_etosha |> filter(month(t1_) %in% 5:10)
+class(ele_trk_extract_wet) <- cls
+class(ele_trk_extract_dry) <- cls
+
+stopifnot(all(c("id", "t1_", "case_", "step_id", "aspect") %in% names(ele_trk_extract_dry)))
+c(dry = nrow(ele_trk_extract_dry), wet = nrow(ele_trk_extract_wet))
+```
+
+## 3. Hydro-year coverage
+
+```{r coverage}
+coverage <- bind_rows(
+  as_tibble(ele_trk_extract_dry) |> mutate(season = "dry"),
+  as_tibble(ele_trk_extract_wet) |> mutate(season = "wet")
+) |>
+  filter(case_) |>
+  mutate(hydro_year = if_else(month(t1_) >= 11, year(t1_) + 1L, year(t1_))) |>
+  group_by(season, hydro_year) |>
+  summarise(n_elephants = n_distinct(id), n_used = n(),
+            first = min(t1_), last = max(t1_), .groups = "drop")
+
+print(coverage, n = Inf)   # >>> NEW: actually print it
+```
+
+## 4. Base formula
+
+```{r formula}
+base_vars <- c(
+  # >>> REMOVED: core_dist (~99% zeros; collared elephants stay inside the park)
+  "water_rivers_dist", "tree_cover_dist", "grassland_dist", "shrubland_dist",
+  "cropland_dist", "urban_dist", "fence_dist", "road_dist",
+  "elevation",
+  "slope", "northness", "eastness", "evi", "world_pop"
+)
+
+f_base <- reformulate(c(base_vars, "strata(step_id)"), response = "case_")
+
+# NA share per covariate (drop_na() in prep removes a row if ANY is NA)
+as_tibble(ele_trk_extract_etosha) |>
+  summarise(across(any_of(c(base_vars, "aspect")), ~ mean(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "var", values_to = "prop_na") |>
+  arrange(desc(prop_na))
+```
+
+## 5. Prep, scaling, pooled model
+
+```{r prep-pooled}
+prep_ssf <- function(data) {
+  cls <- class(data)
+  out <- data |>
+    mutate(
+      hydro_year = if_else(month(t1_) >= 11, year(t1_) + 1L, year(t1_)),
+      northness  = cos(aspect * pi / 180),
+      eastness   = sin(aspect * pi / 180)
+    ) |>
+    drop_na(all_of(base_vars)) |>
+    group_by(step_id) |>
+    filter(any(case_) & any(!case_)) |>
+    ungroup()
+  class(out) <- cls
+  out
+}
+
+dry_prep <- prep_ssf(ele_trk_extract_dry)
+wet_prep <- prep_ssf(ele_trk_extract_wet)
+
+range(ele_trk_extract_dry$aspect, na.rm = TRUE)
+count(as_tibble(dry_prep), hydro_year, case_)
+
+# Fixed scaling on all years pooled (reused for every year + the rasters)
+get_scaling <- function(data, vars) {
+  tibble(var  = vars,
+         mean = map_dbl(vars, ~ mean(data[[.x]], na.rm = TRUE)),
+         sd   = map_dbl(vars, ~ sd(data[[.x]],   na.rm = TRUE)),
+         min  = map_dbl(vars, ~ min(data[[.x]],  na.rm = TRUE)),   # >>> NEW: scale_stack() clamps to this
+         max  = map_dbl(vars, ~ max(data[[.x]],  na.rm = TRUE)))   # >>> NEW
+}
+apply_scaling <- function(data, sc) {
+  for (i in seq_len(nrow(sc))) {
+    data[[sc$var[i]]] <- (data[[sc$var[i]]] - sc$mean[i]) / sc$sd[i]
+  }
+  data
+}
+
+sc_dry <- get_scaling(dry_prep, base_vars)
+sc_wet <- get_scaling(wet_prep, base_vars)
+
+m_base_dry <- dry_prep |> apply_scaling(sc_dry) |> fit_ssf(f_base, model = FALSE)
+m_base_wet <- wet_prep |> apply_scaling(sc_wet) |> fit_ssf(f_base, model = FALSE)
+
+summary(m_base_dry)
+summary(m_base_wet)
+```
+
+## 6. Per-hydro-year fits
+
+```{r by-year}
+# >>> MOVED UP: tidy_fit() is used here
+tidy_fit <- function(fit) {
+  s <- summary(fit$model)$coefficients
+  tibble(term = rownames(s), estimate = s[, "coef"], se = s[, "se(coef)"])
+}
+
+fit_by_year <- function(prep, sc, years = NULL, min_ids = 15, min_used = 2000) {   # >>> CHANGED: min_ids 15
+  cls <- class(prep)
+
+  samples <- prep |>
+    as_tibble() |>
+    filter(case_) |>
+    group_by(hydro_year) |>
+    summarise(n_elephants = n_distinct(id), n_used = n(), .groups = "drop") |>
+    mutate(passes_gate = n_elephants >= min_ids & n_used >= min_used,
+           requested   = is.null(years) | hydro_year %in% years,
+           fitted      = passes_gate & requested)
+
+  keep <- samples |> filter(fitted) |> pull(hydro_year)
+
+  fits <- map(set_names(keep), \(yr) {
+    d <- prep |> filter(hydro_year == yr)
+    class(d) <- cls
+    d |> apply_scaling(sc) |> fit_ssf(f_base, model = FALSE)
+  })
+
+  list(samples = samples, fits = fits)
+}
+
+# >>> REMOVED: rm(yr_dry, yr_wet, coef_by_year) — errors in a fresh session / when knitting
+
+yr_dry <- fit_by_year(dry_prep, sc_dry)
+yr_wet <- fit_by_year(wet_prep, sc_wet)
+
+print(yr_dry$samples, n = Inf)   # expect dry 2009–2011 fitted
+print(yr_wet$samples, n = Inf)   # expect wet 2010–2012 fitted
+
+coef_by_year <- bind_rows(
+  map_dfr(yr_dry$fits, tidy_fit, .id = "hydro_year") |> mutate(season = "dry"),
+  map_dfr(yr_wet$fits, tidy_fit, .id = "hydro_year") |> mutate(season = "wet")
+)
+coef_pooled <- bind_rows(
+  tidy_fit(m_base_dry) |> mutate(season = "dry"),
+  tidy_fit(m_base_wet) |> mutate(season = "wet")
+)
+
+# Elevation vs water: watch for large opposite-sign pairs
+coef_by_year |>
+  filter(term %in% c("elevation", "water_rivers_dist")) |>
+  select(season, hydro_year, term, estimate) |>
+  pivot_wider(names_from = term, values_from = estimate) |>
+  print(n = Inf)
+
+# Anything implausibly large?
+coef_by_year |> filter(abs(estimate) > 3 | se > 1)
+```
+
+## 7. Coefficient plot
+
+```{r coef-plot, fig.width = 11, fig.height = 12}
+# >>> REMOVED: old facet_grid version (unreadable with 14 terms)
+p_coef <- coef_by_year |>
+  mutate(hydro_year = factor(hydro_year)) |>
+  ggplot(aes(x = hydro_year, y = estimate, colour = season)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_hline(data = coef_pooled, aes(yintercept = estimate, colour = season),
+             linetype = "dashed", linewidth = 0.4) +
+  geom_pointrange(aes(ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se),
+                  position = position_dodge(width = 0.5), size = 0.25) +
+  facet_wrap(~ term, scales = "free_y", ncol = 3) +
+  scale_colour_manual(values = c(dry = "#b8651b", wet = "#2b6c9e")) +
+  labs(x = "Hydrological year (Nov–Oct, labelled by end year)", y = "Scaled coefficient",
+       colour = "Season",
+       title = "Etosha SSF base model: yearly vs pooled (dashed) coefficients") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+
+p_coef
+```
+
+## 8. Save
+
+```{r save}
+# Full model objects (large: keep local / Drive)
+saveRDS(list(dry = m_base_dry, wet = m_base_wet),
+        here("outputs", "etosha_ssf_base_pooled.rds"))
+saveRDS(list(dry = yr_dry, wet = yr_wet),
+        here("outputs", "etosha_ssf_base_by_hydroyear.rds"))
+
+# >>> NEW: coefficient-only versions (small, git-safe). Same structure Marissa's
+# resistance script expects; predict_ssf_surface() reads $coef
+coef_only <- \(fit) list(coef = coef(fit$model))
+saveRDS(list(dry = coef_only(m_base_dry), wet = coef_only(m_base_wet)),
+        here("outputs", "etosha_ssf_base_pooled_coefonly.rds"))
+saveRDS(list(dry = list(samples = yr_dry$samples, fits = map(yr_dry$fits, coef_only)),
+             wet = list(samples = yr_wet$samples, fits = map(yr_wet$fits, coef_only))),
+        here("outputs", "etosha_ssf_base_by_hydroyear_coefonly.rds"))
+
+saveRDS(list(dry = sc_dry, wet = sc_wet, vars = base_vars),
+        here("outputs", "etosha_ssf_base_scaling.rds"))
+
+write_csv(coef_by_year, here("outputs", "etosha_ssf_coef_by_hydroyear.csv"))
+write_csv(bind_rows(yr_dry$samples |> mutate(season = "dry"),
+                    yr_wet$samples |> mutate(season = "wet")),
+          here("outputs", "etosha_ssf_hydroyear_samples.csv"))
+
+# >>> CHANGED: one ggsave, with the plot named explicitly
+ggsave(here("outputs", "etosha_ssf_coef_by_hydroyear.png"), p_coef,
+       width = 11, height = 12, dpi = 200)
+
+# Sanity checks before pushing
+sc_dry$var                                   # no core_dist; has elevation + water
+names(yr_dry$fits); names(yr_wet$fits)
+file.size(here("outputs", c("etosha_ssf_base_pooled.rds",
+                            "etosha_ssf_base_by_hydroyear.rds",
+                            "etosha_ssf_base_pooled_coefonly.rds",
+                            "etosha_ssf_base_by_hydroyear_coefonly.rds"))) / 1e6   # MB
+```
+
+## Appendix: why core_dist was dropped
+
+Not run when knitting (`eval = FALSE`). Run by hand to reproduce the map.
+
+```{r core-dist-check, eval = FALSE}
+core_r <- rast(here("data", "500m_data", "core_dist_rast_500m.tif"))
+terra::plot(core_r == 0, col = c("grey90", "darkgreen"), main = "Core (green) = distance 0")
+
+used <- as_tibble(ele_trk_extract_etosha) |> filter(case_)
+pt_crs <- if (max(abs(used$x2_), na.rm = TRUE) < 180) "EPSG:4326" else "EPSG:32733"
+
+set.seed(1)
+samp <- used |> filter(!is.na(x2_), !is.na(y2_)) |> slice_sample(n = 20000)
+v <- vect(samp, geom = c("x2_", "y2_"), crs = pt_crs) |> project(crs(core_r))
+
+e <- ext(v) + 0.5
+terra::plot(crop(core_r == 0, e), col = c("grey90", "#2e7d32"), legend = FALSE,
+            main = "Etosha used GPS points over core area")
+points(v[which(samp$core_dist == 0)], cex = 0.2, col = "#1f4e79")
+points(v[which(samp$core_dist > 0)],  cex = 0.5, col = "#d95f02")
+legend("bottomleft", c("core", "point: stored core_dist = 0", "point: stored core_dist > 0"),
+       pch = c(15, 16, 16), col = c("#2e7d32", "#1f4e79", "#d95f02"), bty = "n", cex = 0.8)
+
+# Share of steps outside the park, per elephant
+used |>
+  group_by(id) |>
+  summarise(n_steps     = n(),
+            pct_outside = round(100 * mean(core_dist > 0, na.rm = TRUE), 1),
+            max_dist_km = round(max(core_dist, na.rm = TRUE) / 1000, 1)) |>
+  arrange(desc(pct_outside)) |>
+  print(n = Inf)
+```
+
