@@ -168,20 +168,30 @@ build_covariate_stack <- function(season, year) {
 # 7. Predict linear predictor / SSF from model coefficients (REVISED)
 # -----------------------------------------------------------
 
-scale_stack <- function(covariate_stack, scaling_tbl) {
+
+# added scale matching layers in place, keep all other layers untouched and clamp to fitting-data range before scaling (prevents extrapolation)
+scale_stack <- function(covariate_stack, scaling_tbl, clamp_to_fit = TRUE) {
   vars <- intersect(scaling_tbl$var, names(covariate_stack))
-  scaled <- lapply(vars, function(v) {
-    s <- scaling_tbl[scaling_tbl$var == v, ]
-    (covariate_stack[[v]] - s$mean) / s$sd
+  out <- lapply(names(covariate_stack), function(v) {
+    r <- covariate_stack[[v]]
+    if (v %in% vars) {
+      s <- scaling_tbl[scaling_tbl$var == v, ]
+      if (clamp_to_fit) r <- clamp(r, lower = s$min, upper = s$max, values = TRUE)
+      (r - s$mean) / s$sd
+    } else r
   })
-  r <- rast(scaled)
-  names(r) <- vars
+  r <- rast(out)
+  names(r) <- names(covariate_stack)
   r
 }
 
 predict_ssf_surface <- function(model, covariate_stack, scaling_tbl) {
-  # fit_clogit() wraps the model in '$model'; fall back to the object itself if not
   betas <- if (!is.null(model$model)) coef(model$model) else coef(model)
+
+  # changed to not drop NA coefficients silently
+  if (any(is.na(betas))) {
+    warning("NA coefficients dropped: ", paste(names(betas)[is.na(betas)], collapse = ", "))
+  }
   betas <- betas[!is.na(betas)]
 
   missing_in_stack <- setdiff(names(betas), names(covariate_stack))
@@ -189,6 +199,9 @@ predict_ssf_surface <- function(model, covariate_stack, scaling_tbl) {
     stop("Model covariates missing from raster stack: ",
          paste(missing_in_stack, collapse = ", "))
   }
+
+#changed to actually apply the fitting-data scaling before multiplying by betas
+  covariate_stack <- scale_stack(covariate_stack[[names(betas)]], scaling_tbl)
 
   weighted <- lapply(names(betas), function(nm) covariate_stack[[nm]] * betas[[nm]])
   lp <- sum(rast(weighted))
@@ -288,6 +301,11 @@ plot(res_etosha_wet$by_year)   # 2010, 2011, 2012
 plot(res_etosha_dry$by_year)   # 2009, 2010, 2011
 plot(res_etosha_wet$mean_lp, main = "Etosha Wet Resistance (mean LP)")
 plot(res_etosha_dry$mean_lp, main = "Etosha Dry Resistance (mean LP)")
+
+```
+
+```{r, fig.width = 6, fig.height = 3.5}
+plot(drv, main = "Out-of-range driver", mar = c(3, 3, 2, 9), plg = list(cex = 0.7))
 ```
 
 ```{r}
@@ -652,7 +670,7 @@ plet(res_kaza_wet$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMa
 plet(res_kaza_dry$mean_lp, col = rev(terrain.colors(100)), tiles = "OpenStreetMap")
 ```
 
-`
+
 ```{r}
 # ------------------------------------------------------------
 # Resistance surfaces for Western wet/dry, one per year (2008-2020)
