@@ -320,6 +320,23 @@ str(hydroyears_data)       # Shows data types and structure
 summary(hydroyears_data)   # Provides statistical summaries
 head(hydroyears_data)      # Previews the first 6 rows
 
+#make sure that the wet and dry season lines up right in code
+check_fits <- function(season) {
+  smp  <- hydroyears_data[[season]]$samples
+  fits <- hydroyears_data[[season]]$fits
+  map_dfr(names(fits), function(yr) {
+    m <- fits[[yr]]$model
+    tibble(
+      season         = season,
+      hydro_year     = as.integer(yr),
+      nevent_model   = m$nevent,
+      n_used_samples = smp$n_used[smp$hydro_year == as.integer(yr)],
+      match          = nevent_model == n_used_samples
+    )
+  })
+}
+
+bind_rows(check_fits("wet"), check_fits("dry"))
 ```
 
 ```{r}
