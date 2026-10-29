@@ -6,6 +6,16 @@ date: "2026-10-18"
 # ------------------------------------------------------------
 # Assesing change in EVI from 2010-2020
 # ------------------------------------------------------------
+```{r}
+library(here)
+library(tidyverse)
+library(terra)
+
+kaza_valid_area <- vect(here("outputs", "kaza_valid_area.gpkg"))
+etosha_vect <- vect(etosha_pts, geom = c("x2_", "y2_"), crs = "EPSG:4326")
+etosha_valid_area <- buffer(convHull(etosha_vect), width = 50000)
+
+```
 
 ```{r}
 # ------------------------------------------------------------
@@ -105,6 +115,10 @@ summarise_change <- function(r) {
 change_tbl <- map_dfr(evi, summarise_change, .id = "variable") |>
   mutate(variable = paste0("evi_", variable))
 change_tbl
+
+# crop to etosha
+evi_etosha <- map(evi, \(r) r |> crop(etosha_valid_area) |> mask(etosha_valid_area))
+evi_kaza <- map(evi, \(r) r |> crop(kaza_valid_area) |> mask(kaza_valid_area))
 ```
 
 # ------------------------------------------------------------
@@ -328,6 +342,9 @@ source(here("code", "summarise_change.R"))   # or paste the function here
 pop_change_tbl <- summarise_change(pop) |>
   mutate(variable = "world_pop", .before = 1)
 pop_change_tbl
+```
+```{r}
+
 ```
 
 Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
